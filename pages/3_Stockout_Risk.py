@@ -14,6 +14,49 @@ apply_enterprise_theme()
 st.markdown("# ⚠️ Stock-Out Risk Analysis")
 st.markdown("Predictive early warning system for inventory depletion risk.")
 
+
+# ---------------------------------------------------------------------------
+# Feature alignment helpers — fixes "feature names must match" error
+# ---------------------------------------------------------------------------
+def _get_expected_features(model):
+    """Extract the feature names a trained model expects."""
+    if model is None:
+        return None
+    if hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+    if hasattr(model, "booster_"):
+        try:
+            return list(model.booster_.feature_name())
+        except Exception:
+            pass
+    if hasattr(model, "get_booster"):
+        try:
+            return list(model.get_booster().feature_names)
+        except Exception:
+            pass
+    if hasattr(model, "named_steps"):
+        for step in model.named_steps.values():
+            found = _get_expected_features(step)
+            if found is not None:
+                return found
+    return None
+
+
+def _align_features(df: pd.DataFrame, model) -> pd.DataFrame:
+    """Reindex df so its columns match what model was trained on."""
+    expected = _get_expected_features(model)
+    if expected is None:
+        return df
+    aligned = df.copy()
+    for col in expected:
+        if col not in aligned.columns:
+            aligned[col] = 0
+    return aligned.reindex(columns=expected, fill_value=0)
+
+
+# ---------------------------------------------------------------------------
+# Guard checks
+# ---------------------------------------------------------------------------
 if not st.session_state.get("data_loaded"):
     st.warning("⚠️ Please load a dataset first.")
     st.stop()
@@ -34,11 +77,14 @@ if not comparison.empty:
     st.dataframe(comparison, use_container_width=True)
     st.caption(f"**Selected model:** {predictor.model_name} (highest F1 score)")
 
-# Get predictions
+# Get predictions — ✅ FIX: align features before predicting
 try:
-    risk_df = predictor.predict_risk(df)
+    model = predictor.model
+    df_aligned = _align_features(df, model)
+    risk_df = predictor.predict_risk(df_aligned)
 except Exception as e:
     st.error(f"Prediction failed: {e}")
+    st.exception(e)  # show full traceback for debugging
     st.stop()
 
 # Risk distribution
