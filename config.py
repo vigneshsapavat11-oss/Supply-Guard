@@ -17,7 +17,7 @@ PLOTS_DIR = ARTIFACTS_DIR / "plots"
 REPORTS_DIR = ARTIFACTS_DIR / "reports"
 
 # Create directories if they don't exist
-for directory in [DATA_DIR, PROCESSED_DATA_DIR, ARTIFACTS_DIR, 
+for directory in [DATA_DIR, PROCESSED_DATA_DIR, ARTIFACTS_DIR,
                   MODELS_DIR, METRICS_DIR, PLOTS_DIR, REPORTS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -114,15 +114,3 @@ SUSTAINABILITY_WEIGHTS = {
 APP_TITLE = "SupplyGuard"
 APP_SUBTITLE = "Explainable AI for Risk-Aware & Sustainable Supply Chain Management"
 APP_VERSION = "1.0.0"
-
-# Team information
-TEAM_MEMBERS = [
-    "23881A0544 – P. Pallavi",
-    "24885A0507 – S. Vignesh",
-    "23881A0538 – M. Laxman"
-]
-
-PROJECT_GUIDE = "Akshay Kumar Karlapati"
-GUIDE_DESIGNATION = "Assistant Professor"
-GUIDE_DEPARTMENT = "Department of Computer Science and Engineering"
-

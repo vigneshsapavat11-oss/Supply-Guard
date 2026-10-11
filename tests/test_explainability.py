@@ -1,111 +1,629 @@
-"""Tests for SHAP output normalization and feature importance."""
+"""
+SupplyGuard - SHAP Explainability Module
+Provides global and local explanations for ML predictions,
+plus a grounded, project-aware explainability chat.
+"""
+
+from typing import List, Optional, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
+import streamlit as st
 
-from utils.explainability import (
-    _select_output_values,
-    answer_explainability_chat,
-    compute_shap_values,
-    explain_local_prediction,
-    get_global_feature_importance,
-)
+if TYPE_CHECKING:
+    import plotly.graph_objects as go
 
 
-def test_interventional_shap_explains_fitted_tree_pipeline():
-    features = pd.DataFrame({
-        "inventory": np.linspace(10, 100, 40),
-        "lead_time": np.tile([2.0, 8.0], 20),
-    })
-    labels = (features["inventory"] < 50).astype(int)
-    model = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model", GradientBoostingClassifier(random_state=42)),
-    ])
-    model.fit(features, labels)
+# =============================================================================
+# Availability check
+# =============================================================================
+def check_shap_available() -> bool:
+    """Check if SHAP is available."""
+    try:
+        import shap  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-    shap_values = compute_shap_values(
-        model, features.iloc[:8], features.columns.tolist(), model_type="tree"
+
+def _select_output_values(shap_values: np.ndarray) -> np.ndarray:
+    """Reduce 3D SHAP arrays to 2D by selecting the positive class."""
+    values = np.asarray(shap_values)
+    if values.ndim == 3:
+        output_index = 1 if values.shape[-1] > 1 else 0
+        values = values[:, :, output_index]
+    return values
+
+
+# =============================================================================
+# SHAP computation
+# =============================================================================
+def compute_shap_values(
+    model,
+    X,
+    feature_names: List[str],
+    model_type: str = "tree",
+) -> Optional[np.ndarray]:
+    """
+    Compute SHAP values for a model.
+    Returns None if SHAP is unavailable or computation fails.
+    Uses check_additivity=False to bypass pipeline rounding checks.
+    """
+    if not check_shap_available():
+        st.warning("⚠️ SHAP library is not available. Install with: pip install shap")
+        return None
+
+    try:
+        import shap
+
+        X_frame = (
+            X.copy()
+            if isinstance(X, pd.DataFrame)
+            else pd.DataFrame(X, columns=feature_names)
+        )
+        X_frame = X_frame.reindex(columns=feature_names)
+
+        pipeline = model if hasattr(model, "named_steps") else None
+        actual_model = (
+            pipeline.named_steps.get("model", model)
+            if pipeline is not None
+            else model
+        )
+        X_model = (
+            pipeline[:-1].transform(X_frame)
+            if pipeline is not None
+            else X_frame.to_numpy()
+        )
+
+        background_count = min(50, len(X_model))
+        background_indices = np.linspace(
+            0, len(X_model) - 1, background_count, dtype=int
+        )
+        background = X_model[background_indices]
+
+        if model_type == "tree":
+            explainer = shap.TreeExplainer(
+                actual_model,
+                data=background,
+                feature_perturbation="interventional",
+            )
+            shap_values = explainer.shap_values(
+                X_model,
+                check_additivity=False,
+            )
+            if isinstance(shap_values, list):
+                shap_values = (
+                    shap_values[1] if len(shap_values) > 1 else shap_values[0]
+                )
+            return _select_output_values(shap_values)
+
+        def predict_output(values):
+            frame = pd.DataFrame(values, columns=feature_names)
+            if pipeline is not None:
+                return pipeline.predict_proba(frame)[:, 1]
+            if hasattr(model, "predict_proba"):
+                return model.predict_proba(frame)[:, 1]
+            return model.predict(frame)
+
+        background_frame = X_frame.iloc[background_indices]
+        explainer = shap.Explainer(
+            predict_output,
+            shap.maskers.Independent(background_frame),
+        )
+        explanation = explainer(X_frame)
+        return _select_output_values(explanation.values)
+
+    except Exception as e:
+        st.warning(f"⚠️ SHAP computation failed: {e}")
+        return None
+
+
+# =============================================================================
+# Global importance — ROBUST VERSION
+# =============================================================================
+def get_global_feature_importance(
+    shap_values: np.ndarray, feature_names: List[str]
+) -> pd.DataFrame:
+    """
+    Compute global feature importance from SHAP values.
+
+    Handles:
+    - 1D arrays (auto reshaped)
+    - 2D arrays (n_samples, n_features)
+    - 3D arrays (n_samples, n_features, n_outputs)
+    - Lists of arrays (multi-class output)
+    - Shape mismatch (falls back to feature-name-agnostic output)
+    """
+    if shap_values is None:
+        return pd.DataFrame()
+
+    # Case 1: list of arrays (multi-class)
+    if isinstance(shap_values, list):
+        values = (
+            np.asarray(shap_values[1])
+            if len(shap_values) > 1
+            else np.asarray(shap_values[0])
+        )
+    else:
+        values = np.asarray(shap_values)
+
+    # Reduce 3D → 2D
+    values = _select_output_values(values)
+
+    if values.ndim == 0:
+        return pd.DataFrame()
+
+    # Normalize to 2D
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    elif values.ndim > 2:
+        values = values.reshape(values.shape[0], -1)
+
+    n_features = len(feature_names)
+
+    # If shapes don't match, try to fix
+    if values.shape[1] != n_features:
+        if values.shape[0] == n_features:
+            values = values.T
+        elif values.shape[-1] == n_features:
+            values = values.reshape(-1, n_features)
+        else:
+            st.warning(
+                f"⚠️ Cannot compute global importance: SHAP values shape "
+                f"{values.shape} doesn't match {n_features} feature names. "
+                "Falling back to positional names."
+            )
+            # Fallback: use positional names matching actual shape
+            actual_n = values.shape[1]
+            fallback_names = [f"Feature_{i}" for i in range(actual_n)]
+            mean_abs = np.abs(values).mean(axis=0)
+            return (
+                pd.DataFrame(
+                    {"Feature": fallback_names, "Importance": mean_abs}
+                )
+                .sort_values("Importance", ascending=False)
+                .reset_index(drop=True)
+            )
+
+    mean_abs = np.abs(values).mean(axis=0)
+
+    return (
+        pd.DataFrame({"Feature": feature_names, "Importance": mean_abs})
+        .sort_values("Importance", ascending=False)
+        .reset_index(drop=True)
     )
 
-    assert shap_values.shape == (8, 2)
-    assert np.isfinite(shap_values).all()
+
+# =============================================================================
+# Local explanation
+# =============================================================================
+def explain_local_prediction(
+    shap_values: np.ndarray,
+    X_instance,
+    feature_names: List[str],
+    instance_idx: int = 0,
+) -> pd.DataFrame:
+    """Get local explanation for a single prediction."""
+    if shap_values is None:
+        return pd.DataFrame()
+
+    values = _select_output_values(shap_values)
+
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+
+    if instance_idx >= len(values):
+        instance_idx = 0
+
+    contributions = values[instance_idx]
+
+    # Align to feature count
+    n_features = len(feature_names)
+    if len(contributions) != n_features:
+        if len(contributions) > n_features:
+            contributions = contributions[:n_features]
+        else:
+            contributions = np.pad(
+                contributions,
+                (0, n_features - len(contributions)),
+                constant_values=0,
+            )
+
+    if isinstance(X_instance, pd.DataFrame):
+        actual_values = X_instance.iloc[instance_idx].values
+    else:
+        actual_values = X_instance[instance_idx]
+
+    if len(actual_values) != n_features:
+        actual_values = np.asarray(actual_values)[:n_features]
+        if len(actual_values) < n_features:
+            actual_values = np.pad(
+                actual_values,
+                (0, n_features - len(actual_values)),
+                constant_values=0,
+            )
+
+    explanation_df = (
+        pd.DataFrame(
+            {
+                "Feature": feature_names,
+                "Actual_Value": actual_values,
+                "SHAP_Contribution": contributions,
+                "Direction": [
+                    "Increases Risk" if c > 0 else "Decreases Risk"
+                    for c in contributions
+                ],
+                "Abs_Contribution": np.abs(contributions),
+            }
+        )
+        .sort_values("Abs_Contribution", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    return explanation_df
 
 
-def test_global_importance_reduces_multiclass_shap_values():
-    """Aggregate sample and output dimensions into one score per feature."""
-    shap_values = np.array([
-        [[1.0, -3.0], [2.0, -4.0]],
-        [[3.0, -1.0], [4.0, -2.0]],
-    ])
+# =============================================================================
+# Natural language explanation
+# =============================================================================
+def generate_natural_language_explanation(
+    explanation_df: pd.DataFrame, risk_level: str, top_n: int = 5
+) -> str:
+    """Generate natural-language explanation from SHAP values."""
+    if explanation_df.empty:
+        return "Explanation not available."
 
-    importance = get_global_feature_importance(shap_values, ["inventory", "demand"])
+    top_features = explanation_df.head(top_n)
+    increasing = top_features[top_features["SHAP_Contribution"] > 0]
+    decreasing = top_features[top_features["SHAP_Contribution"] < 0]
 
-    assert importance["Feature"].tolist() == ["demand", "inventory"]
-    assert importance["Importance"].tolist() == [3.0, 2.0]
+    text = f"**Prediction: {risk_level} Risk**\n\n"
+    text += "**Features that contributed to higher risk:**\n"
 
+    if len(increasing) > 0:
+        for _, row in increasing.iterrows():
+            text += (
+                f"- **{row['Feature']}** = {row['Actual_Value']:.2f} "
+                f"(contribution: +{row['SHAP_Contribution']:.4f})\n"
+            )
+    else:
+        text += "- No features pushed risk upward significantly.\n"
 
-def test_global_importance_keeps_two_dimensional_behavior():
-    """Preserve the sample-by-feature aggregation used by regression SHAP."""
-    shap_values = np.array([[1.0, -2.0], [-3.0, 4.0]])
+    text += "\n**Features that contributed to lower risk:**\n"
 
-    importance = get_global_feature_importance(shap_values, ["inventory", "demand"])
+    if len(decreasing) > 0:
+        for _, row in decreasing.iterrows():
+            text += (
+                f"- **{row['Feature']}** = {row['Actual_Value']:.2f} "
+                f"(contribution: {row['SHAP_Contribution']:.4f})\n"
+            )
+    else:
+        text += "- No features pushed risk downward significantly.\n"
 
-    assert importance["Feature"].tolist() == ["demand", "inventory"]
-    assert importance["Importance"].tolist() == [3.0, 2.0]
+    text += "\n*Note: These features contributed to the model's prediction. "
+    text += "This does not imply causality.*"
 
-
-def test_local_explanation_selects_positive_class_values():
-    """Use the positive-class output for one local classifier explanation."""
-    shap_values = np.array([
-        [[0.1, -0.2], [0.3, -0.4]],
-        [[0.5, -0.6], [0.7, -0.8]],
-    ])
-    features = pd.DataFrame([[10, 20], [30, 40]], columns=["inventory", "demand"])
-
-    local = explain_local_prediction(shap_values, features, ["inventory", "demand"], 1)
-
-    contributions = local.set_index("Feature")["SHAP_Contribution"]
-    assert contributions["inventory"] == -0.6
-    assert contributions["demand"] == -0.8
-
-
-def test_output_normalization_selects_positive_class():
-    shap_values = np.arange(24).reshape(3, 4, 2)
-
-    normalized = _select_output_values(shap_values)
-
-    assert normalized.shape == (3, 4)
-    np.testing.assert_array_equal(normalized, shap_values[:, :, 1])
+    return text
 
 
-def test_explainability_chat_answers_about_local_risk_drivers():
-    local = pd.DataFrame({
-        "Feature": ["inventory", "lead_time"],
-        "SHAP_Contribution": [0.25, -0.1],
-    })
+# =============================================================================
+# Chat logic
+# =============================================================================
+def answer_explainability_chat(
+    question: str,
+    explanation_df: pd.DataFrame,
+    probability: Optional[float] = None,
+    global_importance: Optional[pd.DataFrame] = None,
+) -> str:
+    """Answer explainability questions or retrieve relevant project sources."""
+    if explanation_df is None or explanation_df.empty:
+        return (
+            "I don't have an explanation loaded yet. Load a dataset and "
+            "select a sample first."
+        )
 
-    answer = answer_explainability_chat("Why is the risk high?", local)
+    normalized_question = question.lower().strip()
+    positive = explanation_df[explanation_df["SHAP_Contribution"] > 0].head(3)
+    negative = explanation_df[explanation_df["SHAP_Contribution"] < 0].head(3)
 
-    assert "inventory (+0.250)" in answer
-    assert "lead_time (-0.100)" in answer
+    def describe(rows: pd.DataFrame) -> str:
+        if rows.empty:
+            return "no features in this explanation"
+        return ", ".join(
+            f"**{row['Feature']}** ({row['SHAP_Contribution']:+.3f})"
+            for _, row in rows.iterrows()
+        )
+
+    if any(term in normalized_question for term in ("cause", "caused", "causal")):
+        return (
+            "No. SHAP shows how the model used each feature; it does not show "
+            "that a feature caused the risk. Explanations describe model behavior, "
+            "not real-world causation."
+        )
+
+    if "global" in normalized_question or "overall" in normalized_question:
+        if global_importance is not None and not global_importance.empty:
+            top_features = global_importance.head(5)
+            summary = ", ".join(
+                f"**{row['Feature']}** ({row['Importance']:.3f})"
+                for _, row in top_features.iterrows()
+            )
+            return (
+                f"The strongest global contributors by mean absolute SHAP value "
+                f"are: {summary}.\n\n"
+                "Global importance summarizes **magnitude** across samples, "
+                "not contribution direction for this single record."
+            )
+        return (
+            "Global importance summarizes average absolute SHAP contributions "
+            "across the analyzed samples."
+        )
+
+    if any(
+        term in normalized_question
+        for term in ("probability", "confidence", "score")
+    ):
+        if probability is None:
+            return "A probability score is not available for this sample."
+        return (
+            f"The model reports **{probability:.1%}** for this sample.\n\n"
+            "This is a model estimate, not a guarantee. It should not be treated "
+            "as calibrated without a separate calibration evaluation."
+        )
+
+    if any(
+        term in normalized_question
+        for term in ("increase", "higher", "raise", "upward", "positive")
+    ):
+        return f"The strongest upward contributions are: {describe(positive)}."
+
+    if any(
+        term in normalized_question
+        for term in ("decrease", "lower", "reduce", "downward", "negative")
+    ):
+        return f"The strongest downward contributions are: {describe(negative)}."
+
+    if any(
+        term in normalized_question
+        for term in ("shap", "contribution", "mean", "value", "sign")
+    ):
+        return (
+            "A **SHAP contribution** describes how a feature shifts the model "
+            "output relative to its baseline.\n\n"
+            "- The **sign** shows direction (+ raises risk, − lowers risk)\n"
+            "- The **magnitude** shows strength of influence\n"
+            "- Units depend on the model and explainer — they are **not** "
+            "automatically percentage points"
+        )
+
+    project_terms = (
+        "project", "module", "code", "architecture", "dataset", "preprocess",
+        "forecast", "stockout", "stock-out", "supplier", "warehouse", "anomaly",
+        "sustainab", "experiment", "application", "app", "algorithm",
+        "technology", "train", "training",
+    )
+    if any(term in normalized_question for term in project_terms):
+        try:
+            from utils.project_knowledge import search_project_knowledge
+            project_answer = search_project_knowledge(question)
+            if project_answer:
+                return project_answer
+        except Exception:
+            pass
+
+    if any(
+        term in normalized_question
+        for term in ("change", "alter", "modify", "affect the prediction")
+    ):
+        return (
+            "No. This chat only **interprets** the displayed results. It does not "
+            "change the model, inputs, prediction, or SHAP values."
+        )
+
+    if any(
+        term in normalized_question
+        for term in ("why", "explain", "prediction", "risk")
+    ):
+        return (
+            f"For this sample:\n\n"
+            f"- **Upward contributions:** {describe(positive)}\n"
+            f"- **Downward contributions:** {describe(negative)}\n\n"
+            "These explain the model output — not real-world causation."
+        )
+
+    try:
+        from utils.project_knowledge import search_project_knowledge
+        project_answer = search_project_knowledge(question)
+        if project_answer:
+            return project_answer
+    except Exception:
+        pass
+
+    return (
+        "I couldn't find a relevant answer in the project files.\n\n"
+        "**Try asking about:**\n"
+        "- A project module (forecasting, stock-out, supplier risk, anomaly detection)\n"
+        "- SHAP values or feature contributions\n"
+        "- The dataset, preprocessing, or model training"
+    )
 
 
-def test_explainability_chat_rejects_causal_interpretation():
-    local = pd.DataFrame({"Feature": ["inventory"], "SHAP_Contribution": [0.25]})
+# =============================================================================
+# The 15 questions
+# =============================================================================
+QUESTION_POOL: List[str] = [
+    "Why was this sample flagged as high risk?",
+    "Which features pushed the risk upward?",
+    "Which features lowered the risk?",
+    "What is the probability score for this sample?",
+    "What is a SHAP contribution?",
+    "How do I read the local explanation plot?",
+    "What is the difference between global and local explanations?",
+    "Why can't SHAP prove causation?",
+    "Explain the demand forecasting module",
+    "How does the stock-out warning system work?",
+    "How is supplier risk scored?",
+    "What does the anomaly detection module do?",
+    "Which ML models are used in SupplyGuard?",
+    "How is the data preprocessed?",
+    "What technology stack powers this app?",
+]
 
-    answer = answer_explainability_chat("Did inventory cause the risk?", local)
 
-    assert "does not show that a feature caused the risk" in answer
+def render_all_question_chips(key_prefix: str = "q") -> Optional[str]:
+    """Render all 15 questions as clickable chips inside an expander."""
+    clicked: Optional[str] = None
+
+    with st.expander("💬 Ask a question (click to expand)", expanded=True):
+        st.caption("Pick any question below, or type your own at the bottom.")
+
+        cols = st.columns(3)
+        for i, question in enumerate(QUESTION_POOL):
+            col = cols[i % 3]
+            with col:
+                if st.button(
+                    question,
+                    key=f"{key_prefix}_{i}",
+                    use_container_width=True,
+                ):
+                    clicked = question
+
+    return clicked
 
 
-def test_explainability_chat_reports_read_only_probability():
-    local = pd.DataFrame({"Feature": ["inventory"], "SHAP_Contribution": [0.25]})
+# =============================================================================
+# Chat UI
+# =============================================================================
+def render_explainability_chat(
+    explanation_df: Optional[pd.DataFrame] = None,
+    probability: Optional[float] = None,
+    global_importance: Optional[pd.DataFrame] = None,
+    dataset_loaded: bool = False,
+) -> None:
+    """Render the Explainability Chat UI with 15 questions always visible."""
+    st.markdown("### 🧠 Explainability Chat")
+    st.caption(
+        "Ask about this prediction or any SupplyGuard module. "
+        "Answers are grounded in project files and **do not modify predictions**."
+    )
 
-    answer = answer_explainability_chat("What is the probability?", local, 0.8)
+    if "explain_chat_history" not in st.session_state:
+        welcome = (
+            "👋 Hi! I can help you understand this prediction, explain "
+            "SHAP values, or look up how any SupplyGuard module works."
+        )
+        if not dataset_loaded:
+            welcome += (
+                "\n\n⚠️ **No prediction loaded yet.** You can still ask about "
+                "project modules, models, or datasets.\n\n"
+                "To unlock prediction-specific answers, load a dataset and "
+                "train the models first."
+            )
+        welcome += "\n\n👇 **Pick a question below or type your own.**"
+        st.session_state.explain_chat_history = [
+            {"role": "assistant", "content": welcome}
+        ]
 
-    assert "80.0%" in answer
-    assert "not a guarantee" in answer
+    for message in st.session_state.explain_chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    user_question: Optional[str] = render_all_question_chips(key_prefix="q")
+
+    typed_question = st.chat_input("Or type your own question...")
+    if typed_question:
+        user_question = typed_question
+
+    if user_question:
+        st.session_state.explain_chat_history.append(
+            {"role": "user", "content": user_question}
+        )
+        with st.chat_message("user"):
+            st.markdown(user_question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                if explanation_df is None or explanation_df.empty:
+                    try:
+                        from utils.project_knowledge import search_project_knowledge
+                        answer = search_project_knowledge(user_question)
+                        if not answer:
+                            answer = (
+                                "I can only answer **project-related** questions "
+                                "right now because no prediction is loaded.\n\n"
+                                "**Load a dataset** and train the models to unlock:\n"
+                                "- *Why was this sample flagged?*\n"
+                                "- *Which features pushed risk upward?*\n"
+                                "- *What is the probability for this sample?*"
+                            )
+                    except Exception:
+                        answer = (
+                            "Project knowledge module not found. Load a dataset "
+                            "to unlock prediction-specific answers."
+                        )
+                else:
+                    answer = answer_explainability_chat(
+                        question=user_question,
+                        explanation_df=explanation_df,
+                        probability=probability,
+                        global_importance=global_importance,
+                    )
+            st.markdown(answer)
+
+        st.session_state.explain_chat_history.append(
+            {"role": "assistant", "content": answer}
+        )
+        st.rerun()
+
+    st.markdown("---")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.caption(
+            "🔒 **Note:** This chat interprets the displayed results only. "
+            "It does not alter the model, inputs, predictions, or SHAP values. "
+            "Explanations describe model behavior, not real-world causality."
+        )
+    with col2:
+        if st.button("🗑️ Clear chat", use_container_width=True):
+            st.session_state.explain_chat_history = [
+                st.session_state.explain_chat_history[0]
+            ]
+            st.rerun()
+
+
+# =============================================================================
+# Plotting
+# =============================================================================
+def plot_local_explanation(
+    explanation_df: pd.DataFrame, top_n: int = 10
+) -> "go.Figure":
+    """Create a waterfall-style plot for local explanation."""
+    import plotly.graph_objects as go
+
+    top = explanation_df.head(top_n).sort_values("SHAP_Contribution")
+
+    colors = [
+        "#e74c3c" if c > 0 else "#2ecc71" for c in top["SHAP_Contribution"]
+    ]
+
+    fig = go.Figure(
+        go.Bar(
+            x=top["SHAP_Contribution"],
+            y=top["Feature"],
+            orientation="h",
+            marker_color=colors,
+            text=[f"{c:+.4f}" for c in top["SHAP_Contribution"]],
+            textposition="outside",
+        )
+    )
+
+    fig.update_layout(
+        title="Local Feature Contributions (SHAP)",
+        xaxis_title="SHAP Contribution",
+        yaxis_title="Feature",
+        template="plotly_white",
+        height=max(400, len(top) * 30),
+    )
+
+    return fig

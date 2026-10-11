@@ -2,10 +2,7 @@
 
 import streamlit as st
 from utils.ui_theme import apply_enterprise_theme
-from config import (
-    APP_TITLE, APP_SUBTITLE, APP_VERSION,
-    TEAM_MEMBERS, PROJECT_GUIDE, GUIDE_DESIGNATION, GUIDE_DEPARTMENT
-)
+from config import APP_TITLE, APP_SUBTITLE, APP_VERSION
 
 st.set_page_config(page_title="About", page_icon="ℹ️", layout="wide")
 apply_enterprise_theme()
@@ -44,4 +41,16 @@ machine learning and explainability techniques into a unified decision-support s
 | **Research Experiments** | Reproducible experiment logging |
 
 ### 🏗️ System Architecture
+
+SupplyGuard follows a modular pipeline:
+
+1. **Data Ingestion** — CSV upload or bundled sample dataset
+2. **Preprocessing** — Cleaning, type coercion, feature engineering
+3. **Model Training** — Multiple ML models with time-aware validation
+4. **Explainability** — SHAP values for global and local interpretation
+5. **Decision Support** — Risk scoring, redistribution, what-if analysis
+
+---
+
+*Built with Streamlit, scikit-learn, XGBoost, LightGBM, and SHAP.*
 """)
