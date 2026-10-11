@@ -97,6 +97,7 @@ def init_session_state() -> None:
         "filters": {},
         "experiment_log": [],
         "schema_report": None,
+        "last_uploaded_name": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -311,21 +312,23 @@ def render_welcome() -> None:
 
     with col2:
         st.markdown("#### Quick Start")
+
+        # Get current source from session
+        current_source = st.session_state.get("data_source_selection", "Use Sample Dataset")
+        uploaded_file = st.session_state.get("_current_uploaded_file", None)
+
+        # Load button — works for both sample AND uploaded
         if st.button("Load Dataset", use_container_width=True):
             with st.spinner("Loading dataset..."):
-                success, df, _, _ = load_data(
-                    st.session_state.get("data_source_selection", "Use Sample Dataset"),
-                    None,
-                )
+                success, df, _, _ = load_data(current_source, uploaded_file)
                 if success:
                     st.success(f"✅ Dataset loaded: {len(df):,} rows")
+                    st.rerun()
 
+        # Load & Train — also works with uploaded file
         if st.button("Load & Train", use_container_width=True, type="primary"):
             if not st.session_state.data_loaded:
-                success, df, _, _ = load_data(
-                    st.session_state.get("data_source_selection", "Use Sample Dataset"),
-                    None,
-                )
+                success, df, _, _ = load_data(current_source, uploaded_file)
                 if not success:
                     st.stop()
             else:
@@ -430,6 +433,20 @@ def main() -> None:
     init_session_state()
     render_hero()
     data_source, uploaded_file = render_sidebar()
+
+    # Store the uploaded file in session so buttons can access it
+    if uploaded_file is not None:
+        st.session_state["_current_uploaded_file"] = uploaded_file
+        # Auto-load when a new file is uploaded
+        if st.session_state.get("last_uploaded_name") != uploaded_file.name:
+            st.session_state["last_uploaded_name"] = uploaded_file.name
+            st.session_state["data_loaded"] = False  # force reload
+            with st.spinner(f"Loading {uploaded_file.name}..."):
+                success, df, _, _ = load_data(data_source, uploaded_file)
+                if success:
+                    st.success(f"✅ Dataset loaded: {len(df):,} rows")
+    elif data_source == "Use Sample Dataset":
+        st.session_state["_current_uploaded_file"] = None
 
     if st.session_state.data_loaded:
         render_dataset_status()
