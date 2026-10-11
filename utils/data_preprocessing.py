@@ -1,265 +1,306 @@
 """
-SupplyGuard - Feature Engineering Module
-Creates meaningful supply chain features with leakage prevention.
+SupplyGuard - Data Preprocessing Module
+Robust preprocessing pipeline with schema detection and validation.
 """
 
 import pandas as pd
 import numpy as np
-from typing import List, Optional, Dict
-from config import RANDOM_SEED
+from typing import Dict, List, Tuple, Optional, Any
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+import streamlit as st
+from config import DEFAULT_DATE_COLUMN, DEFAULT_TARGET_COLUMN
 
 
-class FeatureEngineer:
+class DataPreprocessor:
     """
-    Feature engineering for supply chain data.
-    All features use only historical information (no future leakage).
+    Robust data preprocessing pipeline for supply chain data.
+    Handles schema detection, missing values, duplicates, and encoding.
     """
     
-    def __init__(self, df: pd.DataFrame, date_col: str = "date", 
-                 target_col: str = "demand",
-                 product_col: str = "product_id",
-                 warehouse_col: str = "warehouse"):
+    def __init__(self, df: pd.DataFrame):
+        self.raw_df = df.copy()
         self.df = df.copy()
-        self.date_col = date_col
-        self.target_col = target_col
-        self.product_col = product_col
-        self.warehouse_col = warehouse_col
-        self.created_features: List[str] = []
+        self.report = {
+            "rows_before": len(df),
+            "rows_after": 0,
+            "missing_values": {},
+            "duplicates_removed": 0,
+            "numerical_features": [],
+            "categorical_features": [],
+            "date_range": None,
+            "target_variable": None,
+            "preprocessing_steps": []
+        }
+        self.label_encoders: Dict[str, LabelEncoder] = {}
+        self.scaler = StandardScaler()
+        self.date_column: Optional[str] = None
+        self.target_column: Optional[str] = None
+
+    def normalize_columns(self) -> pd.DataFrame:
+        """Map common supply-chain CSV header variants to the app's standard schema."""
+        aliases = {
+            "date": ("date", "orderdate", "transactiondate", "invoicedate", "timestamp"),
+            "product_id": ("productid", "skuid", "sku", "itemid", "itemcode"),
+            "warehouse": ("warehouse", "warehouseid", "store", "storeid"),
+            "supplier_id": ("supplierid", "supplier", "suppliername", "vendorid", "vendorname"),
+            "demand": ("demand", "unitssold", "sales", "quantity", "salesquantity", "unitsordered"),
+            "inventory": ("inventory", "inventorylevel", "stocklevel", "stockonhand", "availableinventory"),
+            "lead_time": ("leadtime", "supplierleadtime", "supplierleadtimedays", "leadtimedays"),
+            "price": ("price", "unitprice", "sellingprice"),
+            "promotion": ("promotion", "promotionflag", "promoflag"),
+            "holiday": ("holiday", "holidayflag"),
+            "stockout_label": ("stockoutlabel", "stockoutflag", "stockout"),
+            "demand_forecast": ("demandforecast", "salesforecast"),
+        }
+        normalized_columns = {
+            "".join(character.lower() for character in str(column) if character.isalnum()): column
+            for column in self.df.columns
+        }
+        rename = {}
+        for canonical, variants in aliases.items():
+            if canonical in self.df.columns:
+                continue
+            source = next(
+                (normalized_columns[variant] for variant in variants if variant in normalized_columns),
+                None,
+            )
+            if source is not None:
+                rename[source] = canonical
+
+        if rename:
+            self.df = self.df.rename(columns=rename)
+            renamed = ", ".join(f"{source} -> {target}" for source, target in rename.items())
+            self.report["preprocessing_steps"].append(f"Normalized supply-chain columns: {renamed}")
+        return self.df
         
-        # Ensure date is datetime
-        if date_col in self.df.columns:
-            self.df[date_col] = pd.to_datetime(self.df[date_col])
-            self.df = self.df.sort_values(date_col).reset_index(drop=True)
+    def detect_schema(self) -> Dict[str, Any]:
+        """Detect column types and identify key columns."""
+        schema = {
+            "numerical": [],
+            "categorical": [],
+            "datetime": [],
+            "boolean": []
+        }
+        
+        for col in self.df.columns:
+            if pd.api.types.is_numeric_dtype(self.df[col]):
+                schema["numerical"].append(col)
+            elif pd.api.types.is_datetime64_any_dtype(self.df[col]):
+                schema["datetime"].append(col)
+            elif self.df[col].dtype == bool:
+                schema["boolean"].append(col)
+            else:
+                schema["categorical"].append(col)
+        
+        # Try to detect date columns from strings
+        for col in schema["categorical"][:]:
+            sample = self.df[col].dropna().head(10)
+            if len(sample) > 0:
+                try:
+                    parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
+                    if parsed.notna().mean() >= 0.8:
+                        schema["datetime"].append(col)
+                        schema["categorical"].remove(col)
+                except (ValueError, TypeError):
+                    pass
+        
+        return schema
     
-    def create_temporal_features(self) -> pd.DataFrame:
-        """Create calendar-based temporal features."""
-        if self.date_col not in self.df.columns:
+    def parse_dates(self) -> bool:
+        """Parse date columns with validation."""
+        schema = self.detect_schema()
+        date_cols = schema.get("datetime", [])
+        
+        # Look for common date column names
+        date_candidates = ["date", "order_date", "transaction_date", "timestamp", "ds"]
+        
+        for col in self.df.columns:
+            if col.lower() in date_candidates:
+                try:
+                    self.df[col] = pd.to_datetime(self.df[col], errors="coerce")
+                    invalid_count = self.df[col].isna().sum()
+                    if invalid_count > 0:
+                        st.warning(f"⚠️ {invalid_count} invalid dates found in '{col}'. These rows will be handled.")
+                    self.date_column = col
+                    self.report["preprocessing_steps"].append(f"Parsed date column: {col}")
+                    return True
+                except Exception as e:
+                    st.error(f"❌ Failed to parse dates in '{col}': {e}")
+        
+        if date_cols:
+            self.date_column = date_cols[0]
+            try:
+                self.df[self.date_column] = pd.to_datetime(self.df[self.date_column], errors="coerce")
+                self.report["preprocessing_steps"].append(f"Parsed date column: {self.date_column}")
+                return True
+            except Exception:
+                pass
+        
+        st.info("No date column detected. Time-based forecasting and trend analysis require a date column.")
+        return False
+    
+    def identify_target(self, target_col: Optional[str] = None) -> str:
+        """Identify or set the target variable."""
+        if target_col and target_col in self.df.columns:
+            self.target_column = target_col
+        elif DEFAULT_TARGET_COLUMN in self.df.columns:
+            self.target_column = DEFAULT_TARGET_COLUMN
+        else:
+            # Look for demand-related columns
+            candidates = ["demand", "sales", "quantity", "units_sold", "target", "y"]
+            for col in self.df.columns:
+                if col.lower() in candidates:
+                    self.target_column = col
+                    break
+        
+        if self.target_column:
+            self.report["target_variable"] = self.target_column
+            self.report["preprocessing_steps"].append(f"Target variable: {self.target_column}")
+        else:
+            st.info(
+                "No demand-like target detected. Supply-chain forecasting requires a numeric demand, sales, quantity, or price column."
+            )
+        
+        return self.target_column or ""
+    
+    def handle_missing_values(self, strategy: str = "auto") -> pd.DataFrame:
+        """Handle missing values with appropriate strategies."""
+        missing_before = self.df.isnull().sum()
+        self.report["missing_values"] = missing_before[missing_before > 0].to_dict()
+        
+        if missing_before.sum() == 0:
+            self.report["preprocessing_steps"].append("No missing values found")
             return self.df
         
-        self.df["year"] = self.df[self.date_col].dt.year
-        self.df["month"] = self.df[self.date_col].dt.month
-        self.df["week"] = self.df[self.date_col].dt.isocalendar().week.astype(int)
-        self.df["day"] = self.df[self.date_col].dt.day
-        self.df["day_of_week"] = self.df[self.date_col].dt.dayofweek
-        self.df["quarter"] = self.df[self.date_col].dt.quarter
-        self.df["is_weekend"] = (self.df["day_of_week"] >= 5).astype(int)
+        # Numerical columns: median imputation
+        numerical_cols = self.df.select_dtypes(include=[np.number]).columns
+        for col in numerical_cols:
+            if self.df[col].isnull().any():
+                median_val = self.df[col].median()
+                self.df[col] = self.df[col].fillna(median_val)
         
-        temporal_features = ["year", "month", "week", "day", "day_of_week", "quarter", "is_weekend"]
-        self.created_features.extend(temporal_features)
+        # Categorical columns: mode imputation
+        categorical_cols = self.df.select_dtypes(include=["object"]).columns
+        for col in categorical_cols:
+            if self.df[col].isnull().any():
+                mode_val = self.df[col].mode()
+                if len(mode_val) > 0:
+                    self.df[col] = self.df[col].fillna(mode_val[0])
+                else:
+                    self.df[col] = self.df[col].fillna("Unknown")
+        
+        # Date columns: drop rows with invalid dates
+        if self.date_column and self.df[self.date_column].isnull().any():
+            before = len(self.df)
+            self.df = self.df.dropna(subset=[self.date_column])
+            dropped = before - len(self.df)
+            if dropped > 0:
+                self.report["preprocessing_steps"].append(f"Dropped {dropped} rows with invalid dates")
+        
+        self.report["preprocessing_steps"].append("Handled missing values (median for numerical, mode for categorical)")
         return self.df
     
-    def create_demand_features(self, lags: List[int] = [1, 7, 14, 30],
-                                windows: List[int] = [7, 14, 30]) -> pd.DataFrame:
+    def remove_duplicates(self) -> pd.DataFrame:
+        """Remove duplicate rows."""
+        before = len(self.df)
+        self.df = self.df.drop_duplicates()
+        after = len(self.df)
+        self.report["duplicates_removed"] = before - after
+        if before - after > 0:
+            self.report["preprocessing_steps"].append(f"Removed {before - after} duplicate rows")
+        return self.df
+    
+    def detect_outliers(self, columns: Optional[List[str]] = None, method: str = "iqr") -> pd.DataFrame:
         """
-        Create lag and rolling features for demand.
-        IMPORTANT: Uses shift() to prevent data leakage.
+        Detect outliers but do not remove them automatically.
+        Returns a report of outlier counts.
         """
-        if self.target_col not in self.df.columns:
-            return self.df
+        if columns is None:
+            columns = self.df.select_dtypes(include=[np.number]).columns.tolist()
         
-        group_cols = []
-        if self.product_col in self.df.columns:
-            group_cols.append(self.product_col)
-        if self.warehouse_col in self.df.columns:
-            group_cols.append(self.warehouse_col)
-        
-        if group_cols:
-            grouped = self.df.groupby(group_cols, group_keys=False)
-        else:
-            grouped = self.df
-        
-        # Lag features (shifted to avoid leakage)
-        for lag in lags:
-            col_name = f"lag_{lag}"
-            if group_cols:
-                self.df[col_name] = grouped[self.target_col].shift(lag)
+        outlier_report = {}
+        for col in columns:
+            if method == "iqr":
+                Q1 = self.df[col].quantile(0.25)
+                Q3 = self.df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower = Q1 - 1.5 * IQR
+                upper = Q3 + 1.5 * IQR
+                outliers = ((self.df[col] < lower) | (self.df[col] > upper)).sum()
+            elif method == "zscore":
+                z_scores = np.abs((self.df[col] - self.df[col].mean()) / self.df[col].std())
+                outliers = (z_scores > 3).sum()
             else:
-                self.df[col_name] = self.df[self.target_col].shift(lag)
-            self.created_features.append(col_name)
+                outliers = 0
+            outlier_report[col] = int(outliers)
         
-        # Rolling statistics (shifted by 1 to avoid leakage)
-        for window in windows:
-            if group_cols:
-                self.df[f"rolling_mean_{window}"] = grouped[self.target_col].transform(
-                    lambda x: x.shift(1).rolling(window, min_periods=1).mean()
-                )
-                self.df[f"rolling_std_{window}"] = grouped[self.target_col].transform(
-                    lambda x: x.shift(1).rolling(window, min_periods=1).std()
-                )
-            else:
-                self.df[f"rolling_mean_{window}"] = self.df[self.target_col].shift(1).rolling(window, min_periods=1).mean()
-                self.df[f"rolling_std_{window}"] = self.df[self.target_col].shift(1).rolling(window, min_periods=1).std()
-            self.created_features.extend([f"rolling_mean_{window}", f"rolling_std_{window}"])
-        
-        # Demand growth rate
-        if "lag_1" in self.df.columns and "lag_7" in self.df.columns:
-            self.df["demand_growth_rate"] = np.where(
-                self.df["lag_7"] > 0,
-                (self.df["lag_1"] - self.df["lag_7"]) / self.df["lag_7"],
-                0
-            )
-            self.created_features.append("demand_growth_rate")
-        
-        # Demand volatility
-        if "rolling_std_7" in self.df.columns and "rolling_mean_7" in self.df.columns:
-            self.df["demand_volatility"] = np.where(
-                self.df["rolling_mean_7"] > 0,
-                self.df["rolling_std_7"] / self.df["rolling_mean_7"],
-                0
-            )
-            self.created_features.append("demand_volatility")
-        
+        self.report["outliers"] = outlier_report
         return self.df
     
-    def create_inventory_features(self) -> pd.DataFrame:
-        """Create inventory-based features."""
-        if "inventory" not in self.df.columns:
-            return self.df
+    def encode_categoricals(self, columns: Optional[List[str]] = None) -> pd.DataFrame:
+        """Encode categorical variables using Label Encoding."""
+        if columns is None:
+            columns = self.df.select_dtypes(include=["object"]).columns.tolist()
+            # Exclude date column
+            if self.date_column in columns:
+                columns.remove(self.date_column)
         
-        # Days of inventory (using lagged demand to avoid leakage)
-        if "lag_1" in self.df.columns:
-            self.df["days_of_inventory"] = np.where(
-                self.df["lag_1"] > 0,
-                self.df["inventory"] / self.df["lag_1"],
-                999
-            )
-            self.created_features.append("days_of_inventory")
+        for col in columns:
+            if col in self.df.columns:
+                le = LabelEncoder()
+                self.df[col + "_encoded"] = le.fit_transform(self.df[col].astype(str))
+                self.label_encoders[col] = le
+                self.report["categorical_features"].append(col)
         
-        # Inventory to demand ratio
-        if self.target_col in self.df.columns:
-            self.df["inventory_to_demand_ratio"] = np.where(
-                self.df[self.target_col] > 0,
-                self.df["inventory"] / self.df[self.target_col],
-                0
-            )
-            self.created_features.append("inventory_to_demand_ratio")
-        
-        # Inventory change
-        group_cols = []
-        if self.product_col in self.df.columns:
-            group_cols.append(self.product_col)
-        if self.warehouse_col in self.df.columns:
-            group_cols.append(self.warehouse_col)
-        
-        if group_cols:
-            self.df["inventory_change"] = self.df.groupby(group_cols)["inventory"].diff()
-        else:
-            self.df["inventory_change"] = self.df["inventory"].diff()
-        self.created_features.append("inventory_change")
-        
-        # Inventory velocity
-        if "rolling_mean_7" in self.df.columns:
-            self.df["inventory_velocity"] = np.where(
-                self.df["rolling_mean_7"] > 0,
-                self.df["inventory_change"] / self.df["rolling_mean_7"],
-                0
-            )
-            self.created_features.append("inventory_velocity")
-        
+        self.report["preprocessing_steps"].append(f"Encoded {len(columns)} categorical columns")
         return self.df
     
-    def create_price_features(self) -> pd.DataFrame:
-        """Create price-based features."""
-        if "price" not in self.df.columns:
-            return self.df
+    def get_numerical_features(self) -> List[str]:
+        """Get list of numerical feature columns (excluding target)."""
+        numerical = self.df.select_dtypes(include=[np.number]).columns.tolist()
+        if self.target_column in numerical:
+            numerical.remove(self.target_column)
+        # Remove encoded columns from the list if original exists
+        return [c for c in numerical if not c.endswith("_encoded") or c.replace("_encoded", "") not in self.df.columns]
+    
+    def get_categorical_features(self) -> List[str]:
+        """Get list of categorical feature columns."""
+        return self.df.select_dtypes(include=["object"]).columns.tolist()
+    
+    def run_pipeline(self, target_col: Optional[str] = None) -> Tuple[pd.DataFrame, Dict]:
+        """Run the complete preprocessing pipeline."""
+        self.normalize_columns()
+        self.parse_dates()
+        self.identify_target(target_col)
+        self.remove_duplicates()
+        self.handle_missing_values()
+        self.detect_outliers()
+        self.encode_categoricals()
         
-        # Price difference from rolling mean
-        group_cols = []
-        if self.product_col in self.df.columns:
-            group_cols.append(self.product_col)
+        self.report["rows_after"] = len(self.df)
+        self.report["numerical_features"] = self.get_numerical_features()
+        self.report["categorical_features"] = self.get_categorical_features()
         
-        if group_cols:
-            self.df["price_rolling_mean_7"] = self.df.groupby(group_cols)["price"].transform(
-                lambda x: x.shift(1).rolling(7, min_periods=1).mean()
+        if self.date_column:
+            self.report["date_range"] = (
+                str(self.df[self.date_column].min()),
+                str(self.df[self.date_column].max())
             )
-        else:
-            self.df["price_rolling_mean_7"] = self.df["price"].shift(1).rolling(7, min_periods=1).mean()
         
-        self.df["price_difference"] = self.df["price"] - self.df["price_rolling_mean_7"]
-        self.df["price_ratio"] = np.where(
-            self.df["price_rolling_mean_7"] > 0,
-            self.df["price"] / self.df["price_rolling_mean_7"],
-            1
-        )
-        self.created_features.extend(["price_difference", "price_ratio"])
-        
-        # Competitor price difference
-        if "competitor_price" in self.df.columns:
-            self.df["competitor_price_difference"] = self.df["price"] - self.df["competitor_price"]
-            self.df["price_competitiveness"] = np.where(
-                self.df["competitor_price"] > 0,
-                self.df["price"] / self.df["competitor_price"],
-                1
-            )
-            self.created_features.extend(["competitor_price_difference", "price_competitiveness"])
-        
-        # Discount indicator
-        if "promotion" in self.df.columns:
-            self.df["discount_indicator"] = self.df["promotion"].astype(int)
-            self.created_features.append("discount_indicator")
-        
-        return self.df
+        return self.df, self.report
+
+
+@st.cache_data(show_spinner=False)
+def load_and_preprocess(file_path_or_buffer, target_col: Optional[str] = None):
+    """Cached loading and preprocessing."""
+    if isinstance(file_path_or_buffer, pd.DataFrame):
+        df = file_path_or_buffer.copy()
+    elif isinstance(file_path_or_buffer, str):
+        df = pd.read_csv(file_path_or_buffer)
+    else:
+        df = pd.read_csv(file_path_or_buffer)
     
-    def create_supply_features(self) -> pd.DataFrame:
-        """Create supply-related features."""
-        # Lead time risk
-        if "lead_time" in self.df.columns:
-            if "rolling_mean_7" in self.df.columns:
-                self.df["lead_time_risk"] = np.where(
-                    self.df["rolling_mean_7"] > 0,
-                    self.df["lead_time"] / (self.df["rolling_mean_7"] + 1),
-                    0
-                )
-            else:
-                self.df["lead_time_risk"] = self.df["lead_time"]
-            self.created_features.append("lead_time_risk")
-        
-        # Delivery delay rate (if available)
-        if "delivery_delay" in self.df.columns:
-            self.df["delivery_delay_rate"] = self.df["delivery_delay"]
-            self.created_features.append("delivery_delay_rate")
-        
-        # Supplier reliability (if available)
-        if "supplier_reliability" in self.df.columns:
-            self.df["supplier_reliability_score"] = self.df["supplier_reliability"]
-            self.created_features.append("supplier_reliability_score")
-        
-        return self.df
-    
-    def create_promotion_features(self) -> pd.DataFrame:
-        """Create promotion and holiday features."""
-        if "promotion" in self.df.columns:
-            # Promotion effect (interaction with demand)
-            if self.target_col in self.df.columns:
-                self.df["promotion_effect"] = self.df["promotion"] * self.df[self.target_col]
-                self.created_features.append("promotion_effect")
-        
-        if "holiday" in self.df.columns:
-            if self.target_col in self.df.columns:
-                self.df["holiday_effect"] = self.df["holiday"] * self.df[self.target_col]
-                self.created_features.append("holiday_effect")
-        
-        return self.df
-    
-    def run_all(self) -> pd.DataFrame:
-        """Run all feature engineering steps."""
-        self.create_temporal_features()
-        self.create_demand_features()
-        self.create_inventory_features()
-        self.create_price_features()
-        self.create_supply_features()
-        self.create_promotion_features()
-        
-        # Drop rows with NaN in critical lag features (only for training)
-        # Keep track of original index
-        return self.df
-    
-    def get_feature_columns(self, exclude: List[str] = None) -> List[str]:
-        """Get list of feature columns (excluding target, date, and IDs)."""
-        exclude = exclude or []
-        base_exclude = [self.date_col, self.target_col, self.product_col, self.warehouse_col]
-        base_exclude.extend(exclude)
-        
-        features = [c for c in self.df.columns if c not in base_exclude 
-                   and not c.endswith("_encoded")]
-        return features
+    preprocessor = DataPreprocessor(df)
+    processed_df, report = preprocessor.run_pipeline(target_col)
+    return processed_df, report, preprocessor
