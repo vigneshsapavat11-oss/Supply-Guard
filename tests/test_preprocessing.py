@@ -63,13 +63,13 @@ def test_remove_duplicates():
     assert preprocessor.report["duplicates_removed"] == 10
 
 
-def test_handle_missing_values():
-    """Test missing value handling."""
+def test_handle_missing_values_preserves_numeric_na_for_split_fitted_imputation():
     df = create_test_data()
     df.loc[0:5, "demand"] = np.nan
     preprocessor = DataPreprocessor(df)
     result = preprocessor.handle_missing_values()
-    assert result["demand"].isnull().sum() == 0
+    assert result["demand"].isnull().sum() == 6
+    assert preprocessor.report["missing_values"]["demand"] == 6
 
 
 def test_full_pipeline():
@@ -100,3 +100,4 @@ def test_supply_chain_header_aliases_are_normalized():
 
     assert report["target_variable"] == "demand"
     assert {"date", "product_id", "warehouse", "supplier_id", "demand", "inventory", "lead_time", "price", "stockout_label"}.issubset(processed.columns)
+    assert "Stockout_Flag" in preprocessor.report["dataset_audit"]["potential_leakage_columns"]
